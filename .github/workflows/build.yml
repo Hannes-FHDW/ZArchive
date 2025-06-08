@@ -4,7 +4,7 @@ on:
   push:
     branches: [ master ]
   pull_request:
-  workflow_dispatch: # Added for manual runs
+  workflow_dispatch:
 
 jobs:
   build:
@@ -16,9 +16,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         build_type: [Release]
         c_compiler: [gcc, clang, cl]
-        # We add a new 'arch' key to help us identify the build
-        # It's 'native' by default for the existing jobs
-        arch: [native] 
+        arch: [native]
         include:
           - os: windows-latest
             c_compiler: cl
@@ -32,15 +30,10 @@ jobs:
             c_compiler: clang
             cpp_compiler: clang++
             arch: native
-          # --- NEW SECTION FOR ARM ---
-          # Add a dedicated ARM64 cross-compilation job
           - os: ubuntu-latest
             build_type: Release
-            # The name of the cross-compiler executable for C
             c_compiler: aarch64-linux-gnu-gcc
-            # The name of the cross-compiler executable for C++
             cpp_compiler: aarch64-linux-gnu-g++
-            # Our custom identifier for this architecture
             arch: arm64
         exclude:
           - os: windows-latest
@@ -53,13 +46,31 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    # --- NEW STEP ---
     - name: Install ARM Cross-Compiler (if needed)
-      # This step only runs for our new 'arm64' matrix entry
       if: matrix.arch == 'arm64'
       run: |
         sudo apt-get update
         sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+    # --- NEW STEP ---
+    # Create the necessary vcpkg configuration files for cross-compiling to ARM.
+    - name: Create vcpkg ARM Configuration
+      if: matrix.arch == 'arm64'
+      run: |
+        # 1. Create a toolchain file that tells CMake which compilers to use for ARM
+        echo 'set(CMAKE_C_COMPILER aarch64-linux-gnu-gcc)' > ${{ github.workspace }}/aarch64-toolchain.cmake
+        echo 'set(CMAKE_CXX_COMPILER aarch64-linux-gnu-g++)' >> ${{ github.workspace }}/aarch64-toolchain.cmake
+
+        # 2. Create a custom vcpkg triplet file for ARM
+        # This tells vcpkg the target architecture and points it to our toolchain file.
+        # It's crucial to create this in a subdirectory that vcpkg can find.
+        mkdir ${{ github.workspace }}/custom-triplets
+        cat <<EOF > ${{ github.workspace }}/custom-triplets/arm64-linux.vcpkg
+        set(VCPKG_TARGET_ARCHITECTURE arm64)
+        set(VCPKG_CRT_LINKAGE dynamic)
+        set(VCPKG_LIBRARY_LINKAGE dynamic)
+        set(VCPKG_CHAINLOAD_TOOLCHAIN_FILE \${CMAKE_CURRENT_LIST_DIR}/../../aarch64-toolchain.cmake)
+        EOF
 
     - name: Set reusable strings
       id: strings
@@ -67,23 +78,33 @@ jobs:
       run: |
         echo "build-output-dir=${{ github.workspace }}/build" >> "$GITHUB_OUTPUT"
 
-    - name: Configure CMake
-      # No changes needed here, as it's already parameterized!
-      # CMake is smart enough to detect a cross-compilation from the compiler name.
-      # This now runs for all Linux jobs (native and ARM)
+    - name: Configure CMake (Linux)
       if: runner.os == 'Linux'
-      run: >
-        cmake -B ${{ steps.strings.outputs.build-output-dir }}
-        -DCMAKE_CXX_COMPILER=${{ matrix.cpp_compiler }}
-        -DCMAKE_C_COMPILER=${{ matrix.c_compiler }}
-        -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
-        -DCMAKE_TOOLCHAIN_FILE=/usr/local/share/vcpkg/scripts/buildsystems/vcpkg.cmake
-        -DBUILD_STATIC_TOOL=ON
-        -S ${{ github.workspace }}
+      run: |
+        # This is the base command for all Linux builds
+        CMAKE_ARGS=(
+          "-B ${{ steps.strings.outputs.build-output-dir }}"
+          "-DCMAKE_CXX_COMPILER=${{ matrix.cpp_compiler }}"
+          "-DCMAKE_C_COMPILER=${{ matrix.c_compiler }}"
+          "-DCMAKE_BUILD_TYPE=${{ matrix.build_type }}"
+          "-DCMAKE_TOOLCHAIN_FILE=/usr/local/share/vcpkg/scripts/buildsystems/vcpkg.cmake"
+          "-DBUILD_STATIC_TOOL=ON"
+          "-S ${{ github.workspace }}"
+        )
+
+        # --- MODIFIED SECTION ---
+        # If this is the ARM build, we add the vcpkg triplet arguments.
+        if [[ "${{ matrix.arch }}" == "arm64" ]]; then
+          CMAKE_ARGS+=(
+            "-DVCPKG_TARGET_TRIPLET=arm64-linux"
+            "-DVCPKG_OVERLAY_TRIPLETS=${{ github.workspace }}/custom-triplets"
+          )
+        fi
+        
+        cmake "${CMAKE_ARGS[@]}"
 
     - name: Configure CMake (Windows)
       if: runner.os == 'Windows'
-      # No changes needed here
       run: >
         cmake -B ${{ steps.strings.outputs.build-output-dir }}
         -DCMAKE_CXX_COMPILER=${{ matrix.cpp_compiler }}
@@ -97,10 +118,6 @@ jobs:
       run: cmake --build ${{ steps.strings.outputs.build-output-dir }} --config ${{ matrix.build_type }}
 
     - name: Test
-      # --- IMPORTANT CAVEAT ---
-      # You CANNOT run ARM tests on an x86-64 runner directly.
-      # This step will fail for the ARM build.
-      # We add a condition to skip it for ARM builds.
       if: matrix.arch != 'arm64'
       working-directory: ${{ steps.strings.outputs.build-output-dir }}
       run: ctest --build-config ${{ matrix.build_type }}
@@ -108,6 +125,5 @@ jobs:
     - name: Upload Build Artifacts
       uses: actions/upload-artifact@v4
       with:
-        # The artifact name now includes the architecture
         name: zarchive-build-${{matrix.os}}-${{matrix.build_type}}-${{matrix.c_compiler}}-${{matrix.arch}}
         path: ${{ steps.strings.outputs.build-output-dir }}
